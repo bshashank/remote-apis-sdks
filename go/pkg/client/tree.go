@@ -282,6 +282,22 @@ func (c *Client) ComputeMerkleTree(execRoot, workingDir, remoteWorkingDir string
 	if err := loadFiles(execRoot, workingDir, remoteWorkingDir, is.InputExclusions, is.Inputs, fs, cache, treeSymlinkOpts(c.TreeSymlinkOpts, is.SymlinkBehavior)); err != nil {
 		return digest.Empty, nil, nil, err
 	}
+	// Now add InputDigests
+	for absPath, digest := range is.InputDigests {
+		// inputs = append(inputs, uploadinfo.EntryFromFile(digest, path))
+		normPath, remoteNormPath, err := getExecRootRelPaths(absPath, execRoot, workingDir, remoteWorkingDir)
+		if err != nil {
+			// foo
+			// return digest.Empty, nil, nil, err
+		}
+
+		fs[remoteNormPath] = &fileSysNode{
+			file: &fileNode{
+				ue:           uploadinfo.EntryFromFile(digest, normPath),
+				isExecutable: false,
+			},
+		}
+	}
 	ft, err := buildTree(fs)
 	if err != nil {
 		return digest.Empty, nil, nil, err

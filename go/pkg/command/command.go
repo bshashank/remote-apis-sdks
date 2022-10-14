@@ -107,6 +107,9 @@ type InputSpec struct {
 	// Inputs matching these patterns will be excluded.
 	InputExclusions []*InputExclusion
 
+	// Digests (that are expected to be available in CAS) to be prepared as part of input.
+	InputDigests map[string]digest.Digest
+
 	// Environment variables the command relies on.
 	EnvironmentVariables map[string]string
 
