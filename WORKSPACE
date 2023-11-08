@@ -4,39 +4,53 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
 http_archive(
     name = "io_bazel_rules_go",
-    sha256 = "2b1641428dff9018f9e85c0384f03ec6c10660d935b750e3fa1492a281a53b0f",
+    sha256 = "6b65cb7917b4d1709f9410ffe00ecf3e160edf674b78c54a894471320862184f",
     urls = [
-        "https://mirror.bazel.build/github.com/bazelbuild/rules_go/releases/download/v0.29.0/rules_go-v0.29.0.zip",
-        "https://github.com/bazelbuild/rules_go/releases/download/v0.29.0/rules_go-v0.29.0.zip",
+        "https://mirror.bazel.build/github.com/bazelbuild/rules_go/releases/download/v0.39.0/rules_go-v0.39.0.zip",
+        "https://github.com/bazelbuild/rules_go/releases/download/v0.39.0/rules_go-v0.39.0.zip",
     ],
 )
 
 http_archive(
     name = "bazel_gazelle",
-    sha256 = "de69a09dc70417580aabf20a28619bb3ef60d038470c7cf8442fafcf627c21cb",
+    sha256 = "727f3e4edd96ea20c29e8c2ca9e8d2af724d8c7778e7923a854b2c80952bc405",
     urls = [
-        "https://mirror.bazel.build/github.com/bazelbuild/bazel-gazelle/releases/download/v0.24.0/bazel-gazelle-v0.24.0.tar.gz",
-        "https://github.com/bazelbuild/bazel-gazelle/releases/download/v0.24.0/bazel-gazelle-v0.24.0.tar.gz",
+        "https://mirror.bazel.build/github.com/bazelbuild/bazel-gazelle/releases/download/v0.30.0/bazel-gazelle-v0.30.0.tar.gz",
+        "https://github.com/bazelbuild/bazel-gazelle/releases/download/v0.30.0/bazel-gazelle-v0.30.0.tar.gz",
     ],
 )
-
-# Go dependencies, add or update repos using Gazelle:
-#  * For more details: https://github.com/bazelbuild/bazel-gazelle#update-repos
-#  * Alternatively, manually update the repo in remote-apis-sdks-deps.bzl.
-
-load("//:remote-apis-sdks-deps.bzl", "remote_apis_sdks_go_deps")
-
-# TODO(olaola): conditionally load dependencies by language.
-remote_apis_sdks_go_deps()
 
 load("@bazel_gazelle//:deps.bzl", "gazelle_dependencies", "go_repository")
 load("@io_bazel_rules_go//go:deps.bzl", "go_register_toolchains", "go_rules_dependencies")
 
 go_rules_dependencies()
 
-go_register_toolchains(version = "1.17.4")
+go_register_toolchains(version = "1.20.7")
 
+# Need "build_file_proto_mode" argument.
+go_repository(
+    name = "org_golang_google_grpc",
+    build_file_proto_mode = "disable",
+    importpath = "google.golang.org/grpc",
+    commit = "7aceafcc52f95f31da11dabb4eb4b1803364a9bb"
+)
+
+# Need "build_file_proto_mode" argument.
+go_repository(
+    name = "org_golang_google_api",
+    build_file_proto_mode = "disable",
+    importpath = "google.golang.org/api",
+    sum = "h1:zDobeejm3E7pEG1mNHvdxvjs5XJoCMzyNH+CmwL94Es=",
+    version = "v0.122.0",
+)
+
+# Insert go_repostiry rules before this one to override specific deps.
 gazelle_dependencies()
+
+load("//:go_deps.bzl", "remote_apis_sdks_go_deps")
+
+# gazelle:repository_macro go_deps.bzl%remote_apis_sdks_go_deps
+remote_apis_sdks_go_deps()
 
 # protobuf.
 http_archive(
@@ -68,8 +82,7 @@ load("@com_github_grpc_grpc//bazel:grpc_deps.bzl", "grpc_deps")
 
 grpc_deps()
 
-# Needed for the googleapis protos used by com_github_bazelbuild_remote_apis
-# below.
+# Needed for the googleapis protos used by com_github_bazelbuild_remote_apis below.
 http_archive(
     name = "googleapis",
     build_file = "BUILD.googleapis",
@@ -78,9 +91,13 @@ http_archive(
     urls = ["https://github.com/googleapis/googleapis/archive/143084a2624b6591ee1f9d23e7f5241856642f4d.zip"],
 )
 
-load("@com_github_bazelbuild_remote_apis//:repository_rules.bzl", "switched_rules_by_language")
-
-switched_rules_by_language(
-    name = "bazel_remote_apis_imports",
-    go = True,
+go_repository(
+    name = "com_github_bazelbuild_remote_apis",
+    importpath = "github.com/bazelbuild/remote-apis",
+    sum = "h1:Lj8uXWW95oXyYguUSdQDvzywQb4f0jbJWsoLPQWAKTY=",
+    version = "v0.0.0-20230411132548-35aee1c4a425",
 )
+
+load("@com_github_bazelbuild_remote_apis//:remote_apis_deps.bzl", "remote_apis_go_deps")
+
+remote_apis_go_deps()

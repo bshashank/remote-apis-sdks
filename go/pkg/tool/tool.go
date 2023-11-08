@@ -3,6 +3,7 @@
 package tool
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -26,6 +27,8 @@ import (
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/outerr"
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/rexec"
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/uploadinfo"
+
+	cpb "github.com/bazelbuild/remote-apis-sdks/go/api/command"
 	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 )
 
@@ -79,7 +82,7 @@ func (c *Client) CheckDeterminism(ctx context.Context, actionDigest, actionRoot 
 	return nil
 }
 
-func (c *Client) prepCommand(ctx context.Context, client *rexec.Client, actionDigest, inputRoot string) (*command.Command, error) {
+func (c *Client) prepCommand(ctx context.Context, client *rexec.Client, actionDigest, actionRoot string) (*command.Command, error) {
 	acDg, err := digest.NewFromString(actionDigest)
 	if err != nil {
 		return nil, err
@@ -99,18 +102,31 @@ func (c *Client) prepCommand(ctx context.Context, client *rexec.Client, actionDi
 	if _, err := c.GrpcClient.ReadProto(ctx, cmdDg, commandProto); err != nil {
 		return nil, err
 	}
-	if inputRoot == "" {
+	fetchInputs := actionRoot == ""
+	if fetchInputs {
 		curTime := time.Now().Format(time.RFC3339)
-		inputRoot = filepath.Join(os.TempDir(), acDg.Hash+"_"+curTime)
+		actionRoot = filepath.Join(os.TempDir(), acDg.Hash+"_"+curTime)
+	}
+	inputRoot := filepath.Join(actionRoot, "input")
+	var nodeProperties map[string]*cpb.NodeProperties
+	if fetchInputs {
 		dg, err := digest.NewFromProto(actionProto.GetInputRootDigest())
 		if err != nil {
 			return nil, err
 		}
 		log.Infof("Fetching input tree from input root digest %s into %s", dg, inputRoot)
-		_, _, err = c.GrpcClient.DownloadDirectory(ctx, dg, inputRoot, client.FileMetadataCache)
+		ts, _, err := c.GrpcClient.DownloadDirectory(ctx, dg, inputRoot, client.FileMetadataCache)
 		if err != nil {
 			return nil, err
 		}
+		nodeProperties = make(map[string]*cpb.NodeProperties)
+		for path, t := range ts {
+			if t.NodeProperties != nil {
+				nodeProperties[path] = command.NodePropertiesFromAPI(t.NodeProperties)
+			}
+		}
+	} else if nodeProperties, err = readNodePropertiesFromFile(filepath.Join(actionRoot, "input_node_properties.textproto")); err != nil {
+		return nil, err
 	}
 	contents, err := os.ReadDir(inputRoot)
 	if err != nil {
@@ -121,8 +137,9 @@ func (c *Client) prepCommand(ctx context.Context, client *rexec.Client, actionDi
 		inputPaths = append(inputPaths, f.Name())
 	}
 	// Construct Command object.
-	cmd := commandFromREProto(commandProto)
+	cmd := command.FromREProto(commandProto)
 	cmd.InputSpec.Inputs = inputPaths
+	cmd.InputSpec.InputNodeProperties = nodeProperties
 	cmd.ExecRoot = inputRoot
 	if actionProto.Timeout != nil {
 		cmd.Timeout = actionProto.Timeout.AsDuration()
@@ -130,26 +147,22 @@ func (c *Client) prepCommand(ctx context.Context, client *rexec.Client, actionDi
 	return cmd, nil
 }
 
-func commandFromREProto(cmdPb *repb.Command) *command.Command {
-	cmd := &command.Command{
-		InputSpec: &command.InputSpec{
-			EnvironmentVariables: make(map[string]string),
-		},
-		Identifiers: &command.Identifiers{},
-		WorkingDir:  cmdPb.WorkingDirectory,
-		OutputFiles: cmdPb.OutputFiles,
-		OutputDirs:  cmdPb.OutputDirectories,
-		Platform:    make(map[string]string),
-		Args:        cmdPb.Arguments,
+func readNodePropertiesFromFile(path string) (nps map[string]*cpb.NodeProperties, err error) {
+	if _, err = os.Stat(path); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("error accessing input node properties file: %v", err)
+		}
+		return nil, nil
 	}
-
-	for _, ev := range cmdPb.EnvironmentVariables {
-		cmd.InputSpec.EnvironmentVariables[ev.Name] = ev.Value
+	inTxt, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("error reading input node properties from file: %v", err)
 	}
-	for _, pt := range cmdPb.GetPlatform().GetProperties() {
-		cmd.Platform[pt.Name] = pt.Value
+	ipb := &cpb.InputSpec{}
+	if err := prototext.Unmarshal(inTxt, ipb); err != nil {
+		return nil, fmt.Errorf("error unmarshalling input node properties from file %s: %v", path, err)
 	}
-	return cmd
+	return ipb.InputNodeProperties, nil
 }
 
 // DownloadActionResult downloads the action result of the given action digest
@@ -173,7 +186,7 @@ func (c *Client) DownloadActionResult(ctx context.Context, actionDigest, pathPre
 		return err
 	}
 	// Construct Command object.
-	cmd := commandFromREProto(commandProto)
+	cmd := command.FromREProto(commandProto)
 
 	resPb, err := c.getActionResult(ctx, actionDigest)
 	if err != nil {
@@ -324,10 +337,13 @@ func (c *Client) writeProto(m proto.Message, baseName string) error {
 
 // DownloadAction parses and downloads an action to the given directory.
 // The output directory will have the following:
-//   1. ac.textproto: the action proto file in text format.
-//   2. cmd.textproto: the command proto file in text format.
-//   3. input/: the input tree root directory with all files under it.
-func (c *Client) DownloadAction(ctx context.Context, actionDigest, outputPath string) error {
+//  1. ac.textproto: the action proto file in text format.
+//  2. cmd.textproto: the command proto file in text format.
+//  3. input/: the input tree root directory with all files under it.
+//  4. input_node_properties.txtproto: all the NodeProperties defined on the
+//     input tree, as an InputSpec proto file in text format. Will be omitted
+//     if no NodeProperties are defined.
+func (c *Client) DownloadAction(ctx context.Context, actionDigest, outputPath string, overwrite bool) error {
 	acDg, err := digest.NewFromString(actionDigest)
 	if err != nil {
 		return err
@@ -337,6 +353,36 @@ func (c *Client) DownloadAction(ctx context.Context, actionDigest, outputPath st
 	if _, err := c.GrpcClient.ReadProto(ctx, acDg, actionProto); err != nil {
 		return err
 	}
+
+	// Directory already exists, ask the user for confirmation before overwrite it.
+	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
+		fmt.Printf("Directory '%s' already exists. Do you want to overwrite it? (yes/no): ", outputPath)
+		if !overwrite {
+			reader := bufio.NewReader(os.Stdin)
+			input, err := reader.ReadString('\n')
+			if err != nil {
+				return fmt.Errorf("error reading user input: %v", err)
+			}
+			input = strings.TrimSpace(input)
+			input = strings.ToLower(input)
+
+			if !(input == "yes" || input == "y") {
+				return errors.Errorf("operation aborted.")
+			}
+		}
+		// If the user confirms, remove the existing directory and create a new one
+		err = os.RemoveAll(outputPath)
+		if err != nil {
+			return fmt.Errorf("error removing existing directory: %v", err)
+		}
+	}
+	// Directory doesn't exist, create it.
+	err = os.MkdirAll(outputPath, os.ModePerm)
+	if err != nil {
+		return fmt.Errorf("error creating the directory: %v", err)
+	}
+	log.Infof("Directory created: %v", outputPath)
+
 	if err := c.writeProto(actionProto, filepath.Join(outputPath, "ac.textproto")); err != nil {
 		return err
 	}
@@ -362,8 +408,20 @@ func (c *Client) DownloadAction(ctx context.Context, actionDigest, outputPath st
 	if err != nil {
 		return err
 	}
-	_, _, err = c.GrpcClient.DownloadDirectory(ctx, rDg, rootPath, filemetadata.NewNoopCache())
-	return err
+	ts, _, err := c.GrpcClient.DownloadDirectory(ctx, rDg, rootPath, filemetadata.NewNoopCache())
+	if err != nil {
+		return fmt.Errorf("error fetching input tree: %v", err)
+	}
+	is := &cpb.InputSpec{InputNodeProperties: make(map[string]*cpb.NodeProperties)}
+	for path, t := range ts {
+		if t.NodeProperties != nil {
+			is.InputNodeProperties[path] = command.NodePropertiesFromAPI(t.NodeProperties)
+		}
+	}
+	if len(is.InputNodeProperties) == 0 {
+		return nil
+	}
+	return c.writeProto(is, filepath.Join(outputPath, "input_node_properties.textproto"))
 }
 
 func (c *Client) prepProtos(ctx context.Context, actionRoot string) (string, error) {
@@ -371,15 +429,14 @@ func (c *Client) prepProtos(ctx context.Context, actionRoot string) (string, err
 	if err != nil {
 		return "", err
 	}
-	cmdProto := &repb.Command{}
-	if err := prototext.Unmarshal(cmdTxt, cmdProto); err != nil {
+	cmdPb := &repb.Command{}
+	if err := prototext.Unmarshal(cmdTxt, cmdPb); err != nil {
 		return "", err
 	}
-	cmdPb, err := proto.Marshal(cmdProto)
+	ue, err := uploadinfo.EntryFromProto(cmdPb)
 	if err != nil {
 		return "", err
 	}
-	ue := uploadinfo.EntryFromBlob(cmdPb)
 	if _, _, err := c.GrpcClient.UploadIfMissing(ctx, ue); err != nil {
 		return "", err
 	}
@@ -387,44 +444,51 @@ func (c *Client) prepProtos(ctx context.Context, actionRoot string) (string, err
 	if err != nil {
 		return "", err
 	}
-	actionProto := &repb.Action{}
-	if err := prototext.Unmarshal(ac, actionProto); err != nil {
+	acPb := &repb.Action{}
+	if err := prototext.Unmarshal(ac, acPb); err != nil {
 		return "", err
 	}
-	actionProto.CommandDigest = digest.NewFromBlob(cmdPb).ToProto()
-	acPb, err := proto.Marshal(actionProto)
+	dg, err := digest.NewFromMessage(cmdPb)
 	if err != nil {
 		return "", err
 	}
-	ue = uploadinfo.EntryFromBlob(acPb)
+	acPb.CommandDigest = dg.ToProto()
+	ue, err = uploadinfo.EntryFromProto(acPb)
+	if err != nil {
+		return "", err
+	}
 	if _, _, err := c.GrpcClient.UploadIfMissing(ctx, ue); err != nil {
 		return "", err
 	}
-	return digest.NewFromBlob(acPb).String(), nil
+	dg, err = digest.NewFromMessage(acPb)
+	if err != nil {
+		return "", err
+	}
+	return dg.String(), nil
 }
 
 // ExecuteAction executes an action in a canonical structure remotely.
 // The structure is the same as that produced by DownloadAction.
 // top level >
-//           > ac.textproto (Action text proto)
-//           > cmd.textproto (Command text proto)
-//           > input (Input root)
-//             > inputs...
+//
+//	> ac.textproto (Action text proto)
+//	> cmd.textproto (Command text proto)
+//	> input_node_properties.textproto (InputSpec text proto, optional)
+//	> input (Input root)
+//	  > inputs...
 func (c *Client) ExecuteAction(ctx context.Context, actionDigest, actionRoot, outDir string, oe outerr.OutErr) (*command.Metadata, error) {
 	fmc := filemetadata.NewNoopCache()
 	client := &rexec.Client{
 		FileMetadataCache: fmc,
 		GrpcClient:        c.GrpcClient,
 	}
-	inputRoot := ""
 	if actionRoot != "" {
 		var err error
 		if actionDigest, err = c.prepProtos(ctx, actionRoot); err != nil {
 			return nil, err
 		}
-		inputRoot = filepath.Join(actionRoot, "input")
 	}
-	cmd, err := c.prepCommand(ctx, client, actionDigest, inputRoot)
+	cmd, err := c.prepCommand(ctx, client, actionDigest, actionRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -438,8 +502,13 @@ func (c *Client) ExecuteAction(ctx context.Context, actionDigest, actionRoot, ou
 	fmt.Printf("---------------\n")
 	fmt.Printf("Action digest: %v\n", ec.Metadata.ActionDigest.String())
 	fmt.Printf("Command digest: %v\n", ec.Metadata.CommandDigest.String())
+	fmt.Printf("Stdout digest: %v\n", ec.Metadata.StdoutDigest.String())
+	fmt.Printf("Stderr digest: %v\n", ec.Metadata.StderrDigest.String())
 	fmt.Printf("Number of Input Files: %v\n", ec.Metadata.InputFiles)
 	fmt.Printf("Number of Input Dirs: %v\n", ec.Metadata.InputDirectories)
+	if len(cmd.InputSpec.InputNodeProperties) != 0 {
+		fmt.Printf("Number of Input Node Properties: %d\n", len(cmd.InputSpec.InputNodeProperties))
+	}
 	fmt.Printf("Number of Output Files: %v\n", ec.Metadata.OutputFiles)
 	fmt.Printf("Number of Output Directories: %v\n", ec.Metadata.OutputDirectories)
 	switch ec.Result.Status {
@@ -634,12 +703,16 @@ func (c *Client) flattenTree(ctx context.Context, t *repb.Tree) (string, []strin
 	sort.Strings(paths)
 	for _, path := range paths {
 		output := outputs[path]
+		var np string
+		if output.NodeProperties != nil {
+			np = fmt.Sprintf(" [Node properties: %v]", prototext.MarshalOptions{Multiline: false}.Format(output.NodeProperties))
+		}
 		if output.IsEmptyDirectory {
-			res.WriteString(fmt.Sprintf("%v: [Directory digest: %v]\n", path, output.Digest))
+			res.WriteString(fmt.Sprintf("%v: [Directory digest: %v]%s\n", path, output.Digest, np))
 		} else if output.SymlinkTarget != "" {
-			res.WriteString(fmt.Sprintf("%v: [Symlink digest: %v, Symlink Target: %v]\n", path, output.Digest, output.SymlinkTarget))
+			res.WriteString(fmt.Sprintf("%v: [Symlink digest: %v, Symlink Target: %v]%s\n", path, output.Digest, output.SymlinkTarget, np))
 		} else {
-			res.WriteString(fmt.Sprintf("%v: [File digest: %v]\n", path, output.Digest))
+			res.WriteString(fmt.Sprintf("%v: [File digest: %v]%s\n", path, output.Digest, np))
 		}
 	}
 	return res.String(), paths, nil

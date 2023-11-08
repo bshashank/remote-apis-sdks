@@ -22,7 +22,7 @@ var (
 	hexStringRegex = regexp.MustCompile("^[a-f0-9]+$")
 
 	// HashFn is the digest function used.
-	HashFn = crypto.SHA256
+	HashFn crypto.Hash = crypto.SHA256
 
 	// Empty is the digest of the empty blob.
 	Empty = NewFromBlob([]byte{})
@@ -44,9 +44,7 @@ type Digest struct {
 
 // GetDigestFunction returns the digest function used by the client.
 func GetDigestFunction() repb.DigestFunction_Value {
-	// TODO: replace this line after all clients support Go 1.15 where .String() is defined:
-	// name := strings.ReplaceAll(HashFn.String(), "-", "")
-	name := "SHA256"
+	name := strings.ReplaceAll(HashFn.String(), "-", "")
 	if val, ok := repb.DigestFunction_Value_value[name]; ok {
 		return repb.DigestFunction_Value(val)
 	}
@@ -89,10 +87,13 @@ func (d Digest) Validate() error {
 
 // New creates a new digest from a string and size. It does some basic
 // validation, which makes it marginally superior to constructing a Digest
-// yourself. It returns an error if the hash/size are invalid.
+// yourself. It returns an empty digest and an error if the hash/size are invalid.
 func New(hash string, size int64) (Digest, error) {
 	d := Digest{Hash: hash, Size: size}
-	return d, d.Validate()
+	if err := d.Validate(); err != nil {
+		return Empty, err
+	}
+	return d, nil
 }
 
 // NewFromBlob takes a blob (in the form of a byte array) and returns the
@@ -117,10 +118,13 @@ func NewFromMessage(msg proto.Message) (Digest, error) {
 }
 
 // NewFromProto converts a proto digest to a Digest.
-// It returns an error if the hash/size are invalid.
+// It returns an empty digest and an error if the hash/size are invalid.
 func NewFromProto(dg *repb.Digest) (Digest, error) {
 	d := NewFromProtoUnvalidated(dg)
-	return d, d.Validate()
+	if err := d.Validate(); err != nil {
+		return Empty, err
+	}
+	return d, nil
 }
 
 // NewFromProtoUnvalidated converts a proto digest to a Digest, skipping validation.

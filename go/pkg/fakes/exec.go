@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
+	// Redundant imports are required for the google3 mirror. Aliases should not be changed.
 	regrpc "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	oppb "google.golang.org/genproto/googleapis/longrunning"
@@ -36,6 +37,10 @@ type Exec struct {
 	Cached bool
 	// Any blobs that will be put in the CAS after the fake execution completes.
 	OutputBlobs [][]byte
+	// Name of the logstream to write stdout to.
+	StdOutStreamName string
+	// Name of the logstream to write stderr to.
+	StdErrStreamName string
 	// Number of Execute calls.
 	numExecCalls int32
 	// Used for errors.
@@ -63,6 +68,10 @@ func (s *Exec) Clear() {
 // ExecuteCalls returns the total number of Execute calls.
 func (s *Exec) ExecuteCalls() int {
 	return int(atomic.LoadInt32(&s.numExecCalls))
+}
+
+func fakeOPName(adg digest.Digest) string {
+	return "fake-action-" + adg.String()
 }
 
 func (s *Exec) fakeExecution(dg digest.Digest, skipCacheLookup bool) (*oppb.Operation, error) {
@@ -103,7 +112,7 @@ func (s *Exec) fakeExecution(dg digest.Digest, skipCacheLookup bool) (*oppb.Oper
 		return nil, err
 	}
 	return &oppb.Operation{
-		Name:   "fake",
+		Name:   fakeOPName(dg),
 		Done:   true,
 		Result: &oppb.Operation_Response{Response: any},
 	}, nil
@@ -140,6 +149,18 @@ func (s *Exec) Execute(req *repb.ExecuteRequest, stream regrpc.Execution_Execute
 		s.t.Errorf("unexpected action digest received by fake: expected %v, got %v", s.adg, dg)
 		return status.Error(codes.InvalidArgument, fmt.Sprintf("unexpected digest received: %v", req.ActionDigest))
 	}
+	if s.StdOutStreamName != "" || s.StdErrStreamName != "" {
+		md, err := anypb.New(&repb.ExecuteOperationMetadata{
+			StdoutStreamName: s.StdOutStreamName,
+			StderrStreamName: s.StdErrStreamName,
+		})
+		if err != nil {
+			return err
+		}
+		if err := stream.Send(&oppb.Operation{Name: fakeOPName(dg), Metadata: md}); err != nil {
+			return err
+		}
+	}
 	if op, err := s.fakeExecution(dg, req.SkipCacheLookup); err != nil {
 		return err
 	} else if err = stream.Send(op); err != nil {
@@ -149,7 +170,13 @@ func (s *Exec) Execute(req *repb.ExecuteRequest, stream regrpc.Execution_Execute
 	return nil
 }
 
-// WaitExecution is not implemented on this fake.
 func (s *Exec) WaitExecution(req *repb.WaitExecutionRequest, stream regrpc.Execution_WaitExecutionServer) (err error) {
-	return status.Error(codes.Unimplemented, "method WaitExecution not implemented by test fake")
+	if req.Name != fakeOPName(s.adg) {
+		return status.Errorf(codes.NotFound, "requested operation %v not found", req.Name)
+	}
+	if op, err := s.fakeExecution(s.adg, true); err != nil {
+		return err
+	} else {
+		return stream.Send(op)
+	}
 }

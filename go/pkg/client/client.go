@@ -6,17 +6,21 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"os/user"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/actas"
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/balancer"
+	"github.com/bazelbuild/remote-apis-sdks/go/pkg/casng"
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/chunker"
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/digest"
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/retry"
+	"github.com/bazelbuild/remote-apis-sdks/go/pkg/uploadinfo"
 	"github.com/pkg/errors"
 	"golang.org/x/oauth2"
 	"golang.org/x/sync/semaphore"
@@ -25,6 +29,7 @@ import (
 	"google.golang.org/grpc/credentials/oauth"
 	"google.golang.org/grpc/status"
 
+	// Redundant imports are required for the google3 mirror. Aliases should not be changed.
 	configpb "github.com/bazelbuild/remote-apis-sdks/go/pkg/balancer/proto"
 	regrpc "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
@@ -42,6 +47,9 @@ const (
 	// HomeDirMacro is replaced by the current user's home dir in the CredFile dial parameter.
 	HomeDirMacro = "${HOME}"
 )
+
+// ErrEmptySegment indicates an attempt to construct a resource name with an empty segment.
+var ErrEmptySegment = errors.New("empty segment in resoure name")
 
 // AuthType indicates the type of authentication being used.
 type AuthType int
@@ -110,12 +118,16 @@ func (ce *InitError) Error() string {
 type Client struct {
 	// InstanceName is the instance name for the targeted remote execution instance; e.g. for Google
 	// RBE: "projects/<foo>/instances/default_instance".
-	InstanceName string
-	actionCache  regrpc.ActionCacheClient
-	byteStream   bsgrpc.ByteStreamClient
-	cas          regrpc.ContentAddressableStorageClient
-	execution    regrpc.ExecutionClient
-	operations   opgrpc.OperationsClient
+	// It should NOT be used to construct resource names, but rather only for reusing the instance name as is.
+	// Use the ResourceName method to create correctly formatted resource names.
+	InstanceName  string
+	actionCache   regrpc.ActionCacheClient
+	byteStream    bsgrpc.ByteStreamClient
+	cas           regrpc.ContentAddressableStorageClient
+	useCasNg      bool
+	ngCasUploader *casng.BatchingUploader
+	execution     regrpc.ExecutionClient
+	operations    opgrpc.OperationsClient
 	// Retrier is the Retrier that is used for RPCs made by this client.
 	//
 	// These fields are logically "protected" and are intended for use by extensions of Client.
@@ -132,8 +144,12 @@ type Client struct {
 	// compressed. Use 0 for all writes being compressed, and a negative number for all operations being
 	// uncompressed.
 	CompressedBytestreamThreshold CompressedBytestreamThreshold
-	// MaxBatchDigests is maximum amount of digests to batch in batched operations.
+	// UploadCompressionPredicate is a function called to decide whether a blob should be compressed for upload.
+	UploadCompressionPredicate UploadCompressionPredicate
+	// MaxBatchDigests is maximum amount of digests to batch in upload and download operations.
 	MaxBatchDigests MaxBatchDigests
+	// MaxQueryBatchDigests is maximum amount of digests to batch in CAS query operations.
+	MaxQueryBatchDigests MaxQueryBatchDigests
 	// MaxBatchSize is maximum size in bytes of a batch request for batch operations.
 	MaxBatchSize MaxBatchSize
 	// DirMode is mode used to create directories.
@@ -157,7 +173,8 @@ type Client struct {
 	// UnifiedDownloadTickDuration specifies how often the unified download daemon flushes the pending requests.
 	UnifiedDownloadTickDuration UnifiedDownloadTickDuration
 	// TreeSymlinkOpts controls how symlinks are handled when constructing a tree.
-	TreeSymlinkOpts     *TreeSymlinkOpts
+	TreeSymlinkOpts *TreeSymlinkOpts
+
 	serverCaps          *repb.ServerCapabilities
 	useBatchOps         UseBatchOps
 	casConcurrency      int64
@@ -168,6 +185,9 @@ type Client struct {
 	casDownloadRequests chan *downloadRequest
 	rpcTimeouts         RPCTimeouts
 	creds               credentials.PerRPCCredentials
+	uploadOnce          sync.Once
+	downloadOnce        sync.Once
+	useBatchCompression UseBatchCompression
 }
 
 const (
@@ -178,6 +198,9 @@ const (
 	// DefaultMaxBatchDigests is a suggested approximate limit based on current RBE implementation.
 	// Above that BatchUpdateBlobs calls start to exceed a typical minute timeout.
 	DefaultMaxBatchDigests = 4000
+
+	// DefaultMaxQueryBatchDigests is a suggested limit for the number of items for in batch for a missing blobs query.
+	DefaultMaxQueryBatchDigests = 10_000
 
 	// DefaultDirMode is mode used to create directories.
 	DefaultDirMode = 0777
@@ -226,6 +249,16 @@ func (s CompressedBytestreamThreshold) Apply(c *Client) {
 	c.CompressedBytestreamThreshold = s
 }
 
+// An UploadCompressionPredicate determines whether to compress a blob on upload.
+// Note that the CompressedBytestreamThreshold takes priority over this (i.e. if the blob to be uploaded
+// is smaller than the threshold, this will not be called).
+type UploadCompressionPredicate func(*uploadinfo.Entry) bool
+
+// Apply sets the client's compression predicate.
+func (cc UploadCompressionPredicate) Apply(c *Client) {
+	c.UploadCompressionPredicate = cc
+}
+
 // UtilizeLocality is to specify whether client downloads files utilizing disk access locality.
 type UtilizeLocality bool
 
@@ -237,36 +270,8 @@ func (s UtilizeLocality) Apply(c *Client) {
 // UnifiedUploads is to specify whether client uploads files in the background, unifying operations between different actions.
 type UnifiedUploads bool
 
-func (c *Client) restartUploader() {
-	if c.casUploadRequests == nil {
-		return
-	}
-	close(c.casUploadRequests)
-	c.casUploadRequests = make(chan *uploadRequest, c.UnifiedUploadBufferSize)
-	go c.uploadProcessor()
-}
-
-func (c *Client) restartDownloader() {
-	if c.casDownloadRequests == nil {
-		return
-	}
-	close(c.casDownloadRequests)
-	c.casDownloadRequests = make(chan *downloadRequest, c.UnifiedDownloadBufferSize)
-	go c.downloadProcessor()
-}
-
 // Apply sets the client's UnifiedUploads.
-// Note: it is unsafe to change this property when connections are ongoing.
 func (s UnifiedUploads) Apply(c *Client) {
-	if c.UnifiedUploads == s {
-		return
-	}
-	if s {
-		c.casUploadRequests = make(chan *uploadRequest, c.UnifiedUploadBufferSize)
-		go c.uploadProcessor()
-	} else {
-		close(c.casUploadRequests)
-	}
 	c.UnifiedUploads = s
 }
 
@@ -278,10 +283,7 @@ const DefaultUnifiedUploadBufferSize = 10000
 
 // Apply sets the client's UnifiedDownloadBufferSize.
 func (s UnifiedUploadBufferSize) Apply(c *Client) {
-	if c.UnifiedUploadBufferSize != s {
-		c.UnifiedUploadBufferSize = s
-		c.restartUploader()
-	}
+	c.UnifiedUploadBufferSize = s
 }
 
 // UnifiedUploadTickDuration is to tune how often the daemon for UnifiedUploads flushes the pending requests.
@@ -292,10 +294,7 @@ const DefaultUnifiedUploadTickDuration = UnifiedUploadTickDuration(50 * time.Mil
 
 // Apply sets the client's UnifiedUploadTickDuration.
 func (s UnifiedUploadTickDuration) Apply(c *Client) {
-	if c.UnifiedUploadTickDuration != s {
-		c.UnifiedUploadTickDuration = s
-		c.restartUploader()
-	}
+	c.UnifiedUploadTickDuration = s
 }
 
 // UnifiedDownloads is to specify whether client uploads files in the background, unifying operations between different actions.
@@ -304,15 +303,6 @@ type UnifiedDownloads bool
 // Apply sets the client's UnifiedDownloads.
 // Note: it is unsafe to change this property when connections are ongoing.
 func (s UnifiedDownloads) Apply(c *Client) {
-	if c.UnifiedDownloads == s {
-		return
-	}
-	if s {
-		c.casDownloadRequests = make(chan *downloadRequest, c.UnifiedDownloadBufferSize)
-		go c.downloadProcessor()
-	} else {
-		close(c.casDownloadRequests)
-	}
 	c.UnifiedDownloads = s
 }
 
@@ -324,10 +314,7 @@ const DefaultUnifiedDownloadBufferSize = 10000
 
 // Apply sets the client's UnifiedDownloadBufferSize.
 func (s UnifiedDownloadBufferSize) Apply(c *Client) {
-	if c.UnifiedDownloadBufferSize != s {
-		c.UnifiedDownloadBufferSize = s
-		c.restartDownloader()
-	}
+	c.UnifiedDownloadBufferSize = s
 }
 
 // UnifiedDownloadTickDuration is to tune how often the daemon for UnifiedDownloads flushes the pending requests.
@@ -338,10 +325,7 @@ const DefaultUnifiedDownloadTickDuration = UnifiedDownloadTickDuration(50 * time
 
 // Apply sets the client's UnifiedDownloadTickDuration.
 func (s UnifiedDownloadTickDuration) Apply(c *Client) {
-	if c.UnifiedDownloadTickDuration != s {
-		c.UnifiedDownloadTickDuration = s
-		c.restartDownloader()
-	}
+	c.UnifiedDownloadTickDuration = s
 }
 
 // Apply sets the client's TreeSymlinkOpts.
@@ -349,12 +333,20 @@ func (o *TreeSymlinkOpts) Apply(c *Client) {
 	c.TreeSymlinkOpts = o
 }
 
-// MaxBatchDigests is maximum amount of digests to batch in batched operations.
+// MaxBatchDigests is maximum amount of digests to batch in upload and download operations.
 type MaxBatchDigests int
 
 // Apply sets the client's maximal batch digests to s.
 func (s MaxBatchDigests) Apply(c *Client) {
 	c.MaxBatchDigests = s
+}
+
+// MaxQueryBatchDigests is maximum amount of digests to batch in query operations.
+type MaxQueryBatchDigests int
+
+// Apply sets the client's maximal batch digests to s.
+func (s MaxQueryBatchDigests) Apply(c *Client) {
+	c.MaxQueryBatchDigests = s
 }
 
 // MaxBatchSize is maximum size in bytes of a batch request for batch operations.
@@ -396,6 +388,15 @@ type UseBatchOps bool
 // Apply sets the UseBatchOps flag on a client.
 func (u UseBatchOps) Apply(c *Client) {
 	c.useBatchOps = u
+}
+
+// UseBatchCompression is currently set to true when the server has
+// SupportedBatchUpdateCompressors capability and supports ZSTD compression.
+type UseBatchCompression bool
+
+// Apply sets the batchCompression flag on a client.
+func (u UseBatchCompression) Apply(c *Client) {
+	c.useBatchCompression = u
 }
 
 // CASConcurrency is the number of simultaneous requests that will be issued for CAS upload and
@@ -447,6 +448,14 @@ type PerRPCCreds struct {
 // Apply saves the per-RPC creds in the Client.
 func (p *PerRPCCreds) Apply(c *Client) {
 	c.creds = p.Creds
+}
+
+// UseCASNG is a feature flag for the casng package.
+type UseCASNG bool
+
+// Apply sets the feature flag value in the Client.
+func (o UseCASNG) Apply(c *Client) {
+	c.useCasNg = bool(o)
 }
 
 func getImpersonatedRPCCreds(ctx context.Context, actAs string, cred credentials.PerRPCCredentials) credentials.PerRPCCredentials {
@@ -549,7 +558,7 @@ func createGRPCInterceptor(p DialParams) *balancer.GCPInterceptor {
 			MaxConcurrentStreamsLowWatermark: p.MaxConcurrentStreams,
 		},
 		Method: []*configpb.MethodConfig{
-			&configpb.MethodConfig{
+			{
 				Name: []string{".*"},
 				Affinity: &configpb.AffinityConfig{
 					Command:     configpb.AffinityConfig_BIND,
@@ -701,7 +710,7 @@ func NewClient(ctx context.Context, instanceName string, params DialParams, opts
 	conn, authUsed, err := Dial(ctx, params.Service, params)
 	casConn := conn
 	if params.CASService != "" && params.CASService != params.Service {
-		log.Infof("Connecting to CAS service %s", params.Service)
+		log.Infof("Connecting to CAS service %s", params.CASService)
 		casConn, authUsed, err = Dial(ctx, params.CASService, params)
 	}
 	if err != nil {
@@ -735,6 +744,7 @@ func NewClientFromConnection(ctx context.Context, instanceName string, conn, cas
 		CompressedBytestreamThreshold: DefaultCompressedBytestreamThreshold,
 		ChunkMaxSize:                  chunker.DefaultChunkSize,
 		MaxBatchDigests:               DefaultMaxBatchDigests,
+		MaxQueryBatchDigests:          DefaultMaxQueryBatchDigests,
 		MaxBatchSize:                  DefaultMaxBatchSize,
 		DirMode:                       DefaultDirMode,
 		ExecutableMode:                DefaultExecutableMode,
@@ -751,6 +761,7 @@ func NewClientFromConnection(ctx context.Context, instanceName string, conn, cas
 		UnifiedDownloadTickDuration:   DefaultUnifiedDownloadTickDuration,
 		UnifiedDownloadBufferSize:     DefaultUnifiedDownloadBufferSize,
 		Retrier:                       RetryTransient(),
+		useCasNg:                      false,
 	}
 	for _, o := range opts {
 		o.Apply(client)
@@ -763,7 +774,71 @@ func NewClientFromConnection(ctx context.Context, instanceName string, conn, cas
 	if client.casConcurrency < 1 {
 		return nil, fmt.Errorf("CASConcurrency should be at least 1")
 	}
+	if client.useCasNg {
+		queryCfg := casng.GRPCConfig{
+			ConcurrentCallsLimit: int(client.casConcurrency),
+			BytesLimit:           int(client.MaxBatchSize),
+			ItemsLimit:           int(client.MaxQueryBatchDigests),
+			BundleTimeout:        10 * time.Millisecond, // Low value to fast track queries.
+			// Timeout:              DefaultRPCTimeouts["FindMissingBlobs"],
+			Timeout:        DefaultRPCTimeouts["default"],
+			RetryPolicy:    client.Retrier.Backoff,
+			RetryPredicate: client.Retrier.ShouldRetry,
+		}
+		batchCfg := casng.GRPCConfig{
+			ConcurrentCallsLimit: int(client.casConcurrency),
+			BytesLimit:           int(client.MaxBatchSize),
+			ItemsLimit:           int(client.UnifiedUploadBufferSize),
+			BundleTimeout:        time.Duration(client.UnifiedUploadTickDuration), // Low value to fast track queries.
+			Timeout:              DefaultRPCTimeouts["BatchUpdateBlobs"],
+			RetryPolicy:          client.Retrier.Backoff,
+			RetryPredicate:       client.Retrier.ShouldRetry,
+		}
+		streamCfg := casng.GRPCConfig{
+			ConcurrentCallsLimit: int(client.casConcurrency),
+			BytesLimit:           1,                // Unused.
+			ItemsLimit:           1,                // Unused.
+			BundleTimeout:        time.Millisecond, // Unused.
+			Timeout:              DefaultRPCTimeouts["default"],
+			RetryPolicy:          client.Retrier.Backoff,
+			RetryPredicate:       client.Retrier.ShouldRetry,
+		}
+		ioCfg := casng.IOConfig{
+			ConcurrentWalksLimit:     int(client.casConcurrency),
+			OpenFilesLimit:           casng.DefaultOpenFilesLimit,
+			OpenLargeFilesLimit:      casng.DefaultOpenLargeFilesLimit,
+			SmallFileSizeThreshold:   casng.DefaultSmallFileSizeThreshold,
+			LargeFileSizeThreshold:   casng.DefaultLargeFileSizeThreshold,
+			CompressionSizeThreshold: int64(client.CompressedBytestreamThreshold),
+			BufferSize:               int(client.ChunkMaxSize),
+		}
+		if client.CompressedBytestreamThreshold < 0 {
+			ioCfg.CompressionSizeThreshold = math.MaxInt64
+		}
+		var err error
+		client.ngCasUploader, err = casng.NewBatchingUploader(ctx, client.cas, client.byteStream, instanceName, queryCfg, batchCfg, streamCfg, ioCfg)
+		if err != nil {
+			return nil, fmt.Errorf("error initializing CASNG: %w", err)
+		}
+	}
+	client.RunBackgroundTasks(ctx)
 	return client, nil
+}
+
+// RunBackgroundTasks starts background goroutines for the client.
+func (c *Client) RunBackgroundTasks(ctx context.Context) {
+	if c.UnifiedUploads {
+		c.uploadOnce.Do(func() {
+			c.casUploadRequests = make(chan *uploadRequest, c.UnifiedUploadBufferSize)
+			go c.uploadProcessor(ctx)
+		})
+	}
+	if c.UnifiedDownloads {
+		c.downloadOnce.Do(func() {
+			c.casDownloadRequests = make(chan *downloadRequest, c.UnifiedDownloadBufferSize)
+			go c.downloadProcessor(ctx)
+		})
+	}
 }
 
 // RPCTimeouts is a Opt that sets the per-RPC deadline.
@@ -789,6 +864,23 @@ var DefaultRPCTimeouts = map[string]time.Duration{
 	// timeout at above 0; most users should use the Action Timeout instead.
 	"Execute":       0,
 	"WaitExecution": 0,
+}
+
+// ResourceName constructs a correctly formatted resource name as defined in the spec.
+// No keyword validation is performed since the semantics of the path are defined by the server.
+// See: https://github.com/bazelbuild/remote-apis/blob/cb8058798964f0adf6dbab2f4c2176ae2d653447/build/bazel/remote/execution/v2/remote_execution.proto#L223
+func (c *Client) ResourceName(segments ...string) (string, error) {
+	segs := make([]string, 0, len(segments)+1)
+	if c.InstanceName != "" {
+		segs = append(segs, c.InstanceName)
+	}
+	for _, s := range segments {
+		if s == "" {
+			return "", ErrEmptySegment
+		}
+		segs = append(segs, s)
+	}
+	return strings.Join(segs, "/"), nil
 }
 
 // RPCOpts returns the default RPC options that should be used for calls made with this client.

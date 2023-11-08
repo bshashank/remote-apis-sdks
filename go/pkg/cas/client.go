@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	// Redundant imports are required for the google3 mirror. Aliases should not be changed.
 	"github.com/pkg/errors"
 	"golang.org/x/sync/semaphore"
 	bsgrpc "google.golang.org/genproto/googleapis/bytestream"
@@ -135,9 +136,10 @@ type RPCConfig struct {
 // DefaultClientConfig returns the default config.
 //
 // To override a specific value:
-//   cfg := DefaultClientConfig()
-//   ... mutate cfg ...
-//   client, err := NewClientWithConfig(ctx, cfg)
+//
+//	cfg := DefaultClientConfig()
+//	... mutate cfg ...
+//	client, err := NewClientWithConfig(ctx, cfg)
 func DefaultClientConfig() ClientConfig {
 	return ClientConfig{
 		// GCE docs recommend at least 32 concurrent IOs.

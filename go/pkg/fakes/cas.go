@@ -22,14 +22,17 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
+	// Redundant imports are required for the google3 mirror. Aliases should not be changed.
 	regrpc "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	bsgrpc "google.golang.org/genproto/googleapis/bytestream"
 	bspb "google.golang.org/genproto/googleapis/bytestream"
 )
 
-var zstdEncoder, _ = zstd.NewWriter(nil, zstd.WithZeroFrames(true))
-var zstdDecoder, _ = zstd.NewReader(nil)
+var (
+	zstdEncoder, _ = zstd.NewWriter(nil, zstd.WithZeroFrames(true))
+	zstdDecoder, _ = zstd.NewReader(nil)
+)
 
 // Reader implements ByteStream's Read interface, returning one blob.
 type Reader struct {
@@ -426,6 +429,18 @@ func (f *CAS) BatchUpdateBlobs(ctx context.Context, req *repb.BatchUpdateBlobsRe
 
 	var resps []*repb.BatchUpdateBlobsResponse_Response
 	for _, r := range req.Requests {
+		if r.Compressor == repb.Compressor_ZSTD {
+			d, err := zstdDecoder.DecodeAll(r.Data, nil)
+			if err != nil {
+				resps = append(resps, &repb.BatchUpdateBlobsResponse_Response{
+					Digest: r.Digest,
+					Status: status.Newf(codes.InvalidArgument, "invalid blob: could not decompress: %s", err).Proto(),
+				})
+				continue
+			}
+			r.Data = d
+		}
+
 		dg := digest.NewFromBlob(r.Data)
 		rdg := digest.NewFromProtoUnvalidated(r.Digest)
 		if dg != rdg {
@@ -490,10 +505,24 @@ func (f *CAS) BatchReadBlobs(ctx context.Context, req *repb.BatchReadBlobsReques
 		f.mu.Lock()
 		f.reads[dg]++
 		f.mu.Unlock()
+
+		useZSTDCompression := false
+		compressor := repb.Compressor_IDENTITY
+		for _, c := range req.AcceptableCompressors {
+			if c == repb.Compressor_ZSTD {
+				compressor = repb.Compressor_ZSTD
+				useZSTDCompression = true
+				break
+			}
+		}
+		if useZSTDCompression {
+			data = zstdEncoder.EncodeAll(data, nil)
+		}
 		resps = append(resps, &repb.BatchReadBlobsResponse_Response{
-			Digest: dgPb,
-			Status: status.New(codes.OK, "").Proto(),
-			Data:   data,
+			Digest:     dgPb,
+			Status:     status.New(codes.OK, "").Proto(),
+			Data:       data,
+			Compressor: compressor,
 		})
 	}
 	return &repb.BatchReadBlobsResponse{Responses: resps}, nil
@@ -671,8 +700,11 @@ func (f *CAS) Write(stream bsgrpc.ByteStream_WriteServer) (err error) {
 
 // Read implements the corresponding RE API function.
 func (f *CAS) Read(req *bspb.ReadRequest, stream bsgrpc.ByteStream_ReadServer) error {
-	if req.ReadOffset != 0 || req.ReadLimit != 0 {
-		return status.Error(codes.Unimplemented, "test fake does not implement read_offset or limit")
+	if req.ReadOffset < 0 {
+		return status.Error(codes.InvalidArgument, "test fake expected a positive value for offset")
+	}
+	if req.ReadLimit != 0 {
+		return status.Error(codes.Unimplemented, "test fake does not implement limit")
 	}
 
 	path := strings.Split(req.ResourceName, "/")
@@ -713,12 +745,25 @@ func (f *CAS) Read(req *bspb.ReadRequest, stream bsgrpc.ByteStream_ReadServer) e
 	}
 
 	resp := &bspb.ReadResponse{}
+	var offset int64
 	for ch.HasNext() {
 		chunk, err := ch.Next()
-		resp.Data = chunk.Data
 		if err != nil {
 			return err
 		}
+		// Seek to req.ReadOffset.
+		offset += int64(len(chunk.Data))
+		if offset < req.ReadOffset {
+			continue
+		}
+		// Scale the offset to the chunk.
+		offset = offset - req.ReadOffset         // The chunk tail that we want.
+		offset = int64(len(chunk.Data)) - offset // The chunk head that we don't want.
+		if offset < 0 {
+			// The chunk is past the offset.
+			offset = 0
+		}
+		resp.Data = chunk.Data[int(offset):]
 		err = stream.Send(resp)
 		if err != nil {
 			return err

@@ -61,7 +61,7 @@ func TestExecCacheHit(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			opt := command.DefaultExecutionOptions()
 			wantRes := &command.Result{Status: command.CacheHitResultStatus}
-			cmdDg, acDg := e.Set(tc.cmd, opt, wantRes, &fakes.OutputFile{Path: "a/b/out", Contents: "output"},
+			cmdDg, acDg, stderrDg, stdoutDg := e.Set(tc.cmd, opt, wantRes, &fakes.OutputFile{Path: "a/b/out", Contents: "output"},
 				fakes.StdOut("stdout"), fakes.StdErrRaw("stderr"))
 			oe := outerr.NewRecordingOutErr()
 			for i := 0; i < 2; i++ {
@@ -87,6 +87,9 @@ func TestExecCacheHit(t *testing.T) {
 					RealBytesDownloaded:    12,
 					OutputFileDigests:      map[string]digest.Digest{"a/b/out": digest.NewFromBlob([]byte("output"))},
 					OutputDirectoryDigests: map[string]digest.Digest{},
+					OutputSymlinks:         map[string]string{},
+					StderrDigest:           stderrDg,
+					StdoutDigest:           stdoutDg,
 				}
 				if diff := cmp.Diff(wantRes, res); diff != "" {
 					t.Errorf("Run() gave result diff (-want +got):\n%s", diff)
@@ -137,7 +140,7 @@ func TestExecNotAcceptCached(t *testing.T) {
 	cmd := &command.Command{Args: []string{"tool"}, ExecRoot: e.ExecRoot}
 	opt := &command.ExecutionOptions{AcceptCached: false, DownloadOutputs: true, DownloadOutErr: true}
 	wantRes := &command.Result{Status: command.SuccessResultStatus}
-	_, acDg := e.Set(cmd, opt, wantRes, fakes.StdOutRaw("not cached"))
+	_, acDg, stderrDg, stdoutDg := e.Set(cmd, opt, wantRes, fakes.StdOutRaw("not cached"))
 	e.Server.ActionCache.Put(acDg, &repb.ActionResult{StdoutRaw: []byte("cached")})
 
 	oe := outerr.NewRecordingOutErr()
@@ -147,6 +150,8 @@ func TestExecNotAcceptCached(t *testing.T) {
 		ActionDigest:     acDg,
 		InputDirectories: 1,
 		TotalOutputBytes: 10,
+		StderrDigest:     stderrDg,
+		StdoutDigest:     stdoutDg,
 	}
 	if diff := cmp.Diff(wantRes, res); diff != "" {
 		t.Errorf("Run() gave result diff (-want +got):\n%s", diff)
@@ -234,7 +239,7 @@ func TestExecDoNotCache_NotAcceptCached(t *testing.T) {
 	// DoNotCache true implies in particular that we also skip action cache lookups, local or remote.
 	opt := &command.ExecutionOptions{DoNotCache: true, DownloadOutputs: true, DownloadOutErr: true}
 	wantRes := &command.Result{Status: command.SuccessResultStatus}
-	_, acDg := e.Set(cmd, opt, wantRes, fakes.StdOutRaw("not cached"))
+	_, acDg, _, _ := e.Set(cmd, opt, wantRes, fakes.StdOutRaw("not cached"))
 	e.Server.ActionCache.Put(acDg, &repb.ActionResult{StdoutRaw: []byte("cached")})
 	oe := outerr.NewRecordingOutErr()
 
@@ -378,6 +383,257 @@ func TestDoNotDownloadOutputs(t *testing.T) {
 				t.Errorf("expected output file %s to not be downloaded, but it was", path)
 			}
 		})
+	}
+}
+
+func TestStreamOutErr(t *testing.T) {
+	tests := []struct {
+		name            string
+		cached          bool
+		status          *status.Status
+		exitCode        int32
+		requestStreams  bool
+		hasStdOutStream bool
+		hasStdErrStream bool
+		outChunks       []string
+		errChunks       []string
+		outContent      string
+		errContent      string
+		wantRes         *command.Result
+		wantStdOut      string
+		wantStdErr      string
+	}{
+		{
+			name:            "success",
+			requestStreams:  true,
+			hasStdOutStream: true,
+			hasStdErrStream: true,
+			wantRes:         &command.Result{Status: command.SuccessResultStatus},
+			wantStdOut:      "streaming-stdout",
+			wantStdErr:      "streaming-stderr",
+		},
+		{
+			name:            "not streaming",
+			requestStreams:  false,
+			hasStdOutStream: true,
+			hasStdErrStream: true,
+			outContent:      "stdout-blob",
+			errContent:      "stderr-blob",
+			wantRes:         &command.Result{Status: command.SuccessResultStatus},
+			wantStdOut:      "stdout-blob",
+			wantStdErr:      "stderr-blob",
+		},
+		{
+			name:            "no stderr stream available",
+			requestStreams:  true,
+			hasStdOutStream: true,
+			hasStdErrStream: false,
+			errContent:      "stderr-blob",
+			wantRes:         &command.Result{Status: command.SuccessResultStatus},
+			wantStdOut:      "streaming-stdout",
+			wantStdErr:      "stderr-blob",
+		},
+		{
+			name:            "no stdout stream available",
+			requestStreams:  true,
+			hasStdOutStream: false,
+			hasStdErrStream: true,
+			outContent:      "stdout-blob",
+			wantRes:         &command.Result{Status: command.SuccessResultStatus},
+			wantStdOut:      "stdout-blob",
+			wantStdErr:      "streaming-stderr",
+		},
+		{
+			name:            "no streams available",
+			requestStreams:  true,
+			hasStdOutStream: false,
+			hasStdErrStream: false,
+			outContent:      "stdout-blob",
+			errContent:      "stderr-blob",
+			wantRes:         &command.Result{Status: command.SuccessResultStatus},
+			wantStdOut:      "stdout-blob",
+			wantStdErr:      "stderr-blob",
+		},
+		{
+			name:            "remote exec cache hit",
+			requestStreams:  true,
+			hasStdOutStream: true,
+			hasStdErrStream: true,
+			cached:          true,
+			wantRes:         &command.Result{Status: command.CacheHitResultStatus},
+			wantStdOut:      "streaming-stdout",
+			wantStdErr:      "streaming-stderr",
+		},
+		{
+			name:            "action cache hit",
+			requestStreams:  true,
+			hasStdOutStream: true,
+			hasStdErrStream: true,
+			outContent:      "stdout-blob",
+			errContent:      "stderr-blob",
+			wantRes:         &command.Result{Status: command.CacheHitResultStatus},
+			wantStdOut:      "stdout-blob",
+			wantStdErr:      "stderr-blob",
+		},
+		{
+			name:            "non zero exit",
+			requestStreams:  true,
+			hasStdOutStream: true,
+			hasStdErrStream: true,
+			exitCode:        11,
+			wantRes:         &command.Result{ExitCode: 11, Status: command.NonZeroExitResultStatus},
+			wantStdOut:      "streaming-stdout",
+			wantStdErr:      "streaming-stderr",
+		},
+		{
+			name:            "remote failure",
+			requestStreams:  true,
+			hasStdOutStream: true,
+			hasStdErrStream: true,
+			status:          status.New(codes.Internal, "problem"),
+			wantRes:         command.NewRemoteErrorResult(status.New(codes.Internal, "problem").Err()),
+			wantStdOut:      "streaming-stdout",
+			wantStdErr:      "streaming-stderr",
+		},
+		{
+			name:            "remote failure partial stream",
+			requestStreams:  true,
+			hasStdOutStream: true,
+			hasStdErrStream: true,
+			outChunks:       []string{"streaming"},
+			errChunks:       []string{"streaming"},
+			outContent:      "streaming-stdout",
+			errContent:      "streaming-stderr",
+			status:          status.New(codes.Internal, "problem"),
+			wantRes:         command.NewRemoteErrorResult(status.New(codes.Internal, "problem").Err()),
+			wantStdOut:      "streaming-stdout",
+			wantStdErr:      "streaming-stderr",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e, cleanup := fakes.NewTestEnv(t)
+			defer cleanup()
+			e.Client.GrpcClient.Retrier = nil // Disable retries
+			cmd := &command.Command{
+				Args:        []string{"tool"},
+				OutputFiles: []string{"a/b/out"},
+				ExecRoot:    e.ExecRoot,
+			}
+			execOpts := &command.ExecutionOptions{
+				AcceptCached:    true,
+				DownloadOutputs: false,
+				DownloadOutErr:  true,
+				StreamOutErr:    tc.requestStreams,
+			}
+			outChunks := tc.outChunks
+			if outChunks == nil {
+				outChunks = []string{"streaming", "-", "stdout"}
+			}
+			errChunks := tc.errChunks
+			if errChunks == nil {
+				errChunks = []string{"streaming", "-", "stderr"}
+			}
+			outContent := tc.outContent
+			if outContent == "" {
+				outContent = "streaming-stdout"
+			}
+			errContent := tc.errContent
+			if errContent == "" {
+				errContent = "streaming-stderr"
+			}
+			opts := []fakes.Option{
+				fakes.StdOut(outContent),
+				fakes.StdErr(errContent),
+				&fakes.LogStream{Name: "stdout-stream", Chunks: outChunks},
+				&fakes.LogStream{Name: "stderr-stream", Chunks: errChunks},
+				fakes.ExecutionCacheHit(tc.cached),
+			}
+			if tc.hasStdOutStream {
+				opts = append(opts, fakes.StdOutStream("stdout-stream"))
+			}
+			if tc.hasStdErrStream {
+				opts = append(opts, fakes.StdErrStream("stderr-stream"))
+			}
+			e.Set(cmd, execOpts, tc.wantRes, opts...)
+			oe := outerr.NewRecordingOutErr()
+			res, _ := e.Client.Run(context.Background(), cmd, execOpts, oe)
+
+			if diff := cmp.Diff(tc.wantRes, res, cmp.Comparer(proto.Equal), cmp.Comparer(equalError)); diff != "" {
+				t.Errorf("Run() gave result diff (-want +got):\n%s", diff)
+			}
+			if got := oe.Stdout(); !bytes.Equal(got, []byte(tc.wantStdOut)) {
+				t.Errorf("Run() gave stdout diff: want %q, got %q", tc.wantStdOut, string(got))
+			}
+			if got := oe.Stderr(); !bytes.Equal(got, []byte(tc.wantStdErr)) {
+				t.Errorf("Run() gave stderr diff: want %q, got %q", tc.wantStdErr, string(got))
+			}
+		})
+	}
+}
+
+func TestOutputSymlinks(t *testing.T) {
+	e, cleanup := fakes.NewTestEnv(t)
+	defer cleanup()
+	e.Client.GrpcClient.Retrier = nil // Disable retries
+	cmd := &command.Command{
+		Args:        []string{"tool"},
+		OutputFiles: []string{"a/b/out"},
+		ExecRoot:    e.ExecRoot,
+	}
+	opt := &command.ExecutionOptions{AcceptCached: true, DownloadOutputs: true, DownloadOutErr: false}
+	wantRes := &command.Result{Status: command.CacheHitResultStatus}
+	cmdDg, acDg, stderrDg, stdoutDg := e.Set(cmd, opt, wantRes, fakes.StdOut("stdout"), fakes.StdErr("stderr"), &fakes.OutputFile{Path: "a/b/out", Contents: "output"}, &fakes.OutputSymlink{Path: "a/b/sl", Target: "out"}, fakes.ExecutionCacheHit(true))
+	oe := outerr.NewRecordingOutErr()
+
+	res, meta := e.Client.Run(context.Background(), cmd, opt, oe)
+
+	if diff := cmp.Diff(wantRes, res, cmp.Comparer(proto.Equal), cmp.Comparer(equalError)); diff != "" {
+		t.Errorf("Run() gave result diff (-want +got):\n%s", diff)
+	}
+	if len(oe.Stdout()) != 0 {
+		t.Errorf("Run() gave unexpected stdout: %v", string(oe.Stdout()))
+	}
+	if len(oe.Stderr()) != 0 {
+		t.Errorf("Run() gave unexpected stderr: %v", string(oe.Stderr()))
+	}
+	path := filepath.Join(e.ExecRoot, "a/b/out")
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("expected output file %s to not be downloaded, but it was", path)
+	}
+	path = filepath.Join(e.ExecRoot, "a/b/sl")
+	file, err := os.Lstat(path)
+	if err != nil {
+		t.Errorf("expected output file %s to be downloaded, but it was not", path)
+	}
+	if file.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("expected output file %s to be a symlink, but it was not", path)
+	}
+	if dest, err := os.Readlink(path); err != nil || dest != "out" {
+		t.Errorf("expected output file %s to link to a/b/out, got %v, %v", path, dest, err)
+	}
+	wantMeta := &command.Metadata{
+		CommandDigest:    cmdDg,
+		ActionDigest:     acDg,
+		InputDirectories: 1,
+		TotalInputBytes:  cmdDg.Size + acDg.Size,
+		OutputFiles:      2,
+		TotalOutputBytes: 18, // "output" + "stdout" + "stderr"
+		// "output" + "stdout" for both. StdErr is inlined in ActionResult in this test, and ActionResult
+		// isn't done through bytestream so not checked here.
+		LogicalBytesDownloaded: 6,
+		RealBytesDownloaded:    6,
+		OutputFileDigests:      map[string]digest.Digest{"a/b/out": digest.NewFromBlob([]byte("output"))},
+		OutputDirectoryDigests: map[string]digest.Digest{},
+		OutputSymlinks:         map[string]string{"a/b/sl": "out"},
+		StderrDigest:           stderrDg,
+		StdoutDigest:           stdoutDg,
+	}
+	if diff := cmp.Diff(wantRes, res); diff != "" {
+		t.Errorf("Run() gave result diff (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff(wantMeta, meta, cmpopts.IgnoreFields(command.Metadata{}, "EventTimes")); diff != "" {
+		t.Errorf("Run() gave result diff (-want +got):\n%s", diff)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +28,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
+	// Redundant imports are required for the google3 mirror. Aliases should not be changed.
+	regrpc "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	bsgrpc "google.golang.org/genproto/googleapis/bytestream"
 )
@@ -477,6 +480,7 @@ func TestUploadConcurrent(t *testing.T) {
 			for _, opt := range []client.Opt{tc.batching, tc.maxBatchDigests, tc.concurrency, tc.unified} {
 				opt.Apply(c)
 			}
+			c.RunBackgroundTasks(ctx)
 
 			eg, eCtx := errgroup.WithContext(ctx)
 			for i := 0; i < 100; i++ {
@@ -501,8 +505,9 @@ func TestUploadConcurrent(t *testing.T) {
 					if fake.BlobWrites(dg) != 1 {
 						t.Errorf("wanted 1 write for blob %v: %v, got %v", i, dg, fake.BlobWrites(dg))
 					}
-					if fake.BlobMissingReqs(dg) != 1 {
-						t.Errorf("wanted 1 missing request for blob %v: %v, got %v", i, dg, fake.BlobMissingReqs(dg))
+					if fake.BlobMissingReqs(dg) != 100 {
+						// 100 requests per blob.
+						t.Errorf("wanted 100 missing request for blob %v: %v, got %v", i, dg, fake.BlobMissingReqs(dg))
 					}
 				}
 			}
@@ -530,6 +535,7 @@ func TestUploadConcurrentBatch(t *testing.T) {
 			c.MaxBatchDigests = 50
 			client.UnifiedUploadTickDuration(500 * time.Millisecond).Apply(c)
 			uo.Apply(c)
+			c.RunBackgroundTasks(ctx)
 
 			eg, eCtx := errgroup.WithContext(ctx)
 			for i := 0; i < 10; i++ {
@@ -557,9 +563,6 @@ func TestUploadConcurrentBatch(t *testing.T) {
 				if c.UnifiedUploads {
 					if fake.BlobWrites(dg) != 1 {
 						t.Errorf("wanted 1 write for blob %v: %v, got %v", i, dg, fake.BlobWrites(dg))
-					}
-					if fake.BlobMissingReqs(dg) != 1 {
-						t.Errorf("wanted 1 missing requests for blob %v: %v, got %v", i, dg, fake.BlobMissingReqs(dg))
 					}
 				}
 			}
@@ -594,6 +597,7 @@ func TestUploadCancel(t *testing.T) {
 			c := e.Client.GrpcClient
 			uo.Apply(c)
 			client.UseBatchOps(false).Apply(c)
+			c.RunBackgroundTasks(ctx)
 
 			cCtx, cancel := context.WithCancel(ctx)
 			eg, _ := errgroup.WithContext(cCtx)
@@ -673,6 +677,7 @@ func TestUploadConcurrentCancel(t *testing.T) {
 			for _, opt := range []client.Opt{tc.batching, tc.maxBatchDigests, tc.concurrency, tc.unified} {
 				opt.Apply(c)
 			}
+			c.RunBackgroundTasks(ctx)
 
 			eg, eCtx := errgroup.WithContext(ctx)
 			eg.Go(func() error {
@@ -705,12 +710,6 @@ func TestUploadConcurrentCancel(t *testing.T) {
 					dg := digest.NewFromBlob(blob)
 					if fake.BlobWrites(dg) != 1 {
 						t.Errorf("wanted 1 write for blob %v: %v, got %v", i, dg, fake.BlobWrites(dg))
-					}
-					// It is possible to get more than 1 GetMissingBlobs requests if all concurrent requests for a particular
-					// digest get cancelled, because then this upload gets actually cancelled and deleted.
-					// This will happen if e.g. the original (non-canceled) upload thread is the last to run.
-					if fake.BlobMissingReqs(dg) > 2 {
-						t.Errorf("wanted <=2 missing requests for blob %v: %v, got %v", i, dg, fake.BlobMissingReqs(dg))
 					}
 				}
 			}
@@ -798,6 +797,7 @@ func TestUpload(t *testing.T) {
 			for _, o := range tc.opts {
 				o.Apply(c)
 			}
+			c.RunBackgroundTasks(ctx)
 
 			present := make(map[digest.Digest]bool)
 			for _, blob := range tc.present {
@@ -1583,6 +1583,7 @@ func TestDownloadActionOutputsConcurrency(t *testing.T) {
 				for _, b := range blobs {
 					fake.Put(b.blob)
 				}
+				c.RunBackgroundTasks(ctx)
 
 				eg, eCtx := errgroup.WithContext(ctx)
 				for i := 0; i < 100; i++ {
@@ -1865,5 +1866,51 @@ func TestDownloadFilesCancel(t *testing.T) {
 			}
 			close(wait)
 		})
+	}
+}
+
+func TestBatchDownloadBlobsCompressed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("Cannot listen: %v", err)
+	}
+	fakeCAS := fakes.NewCAS()
+	defer listener.Close()
+	server := grpc.NewServer()
+	regrpc.RegisterContentAddressableStorageServer(server, fakeCAS)
+	go server.Serve(listener)
+	defer server.Stop()
+	c, err := client.NewClient(ctx, instance, client.DialParams{
+		Service:    listener.Addr().String(),
+		NoSecurity: true,
+	}, client.StartupCapabilities(false))
+	if err != nil {
+		t.Fatalf("Error connecting to server: %v", err)
+	}
+	defer c.Close()
+
+	fooDigest := fakeCAS.Put([]byte("foo"))
+	barDigest := fakeCAS.Put([]byte("bar"))
+	digests := []digest.Digest{fooDigest, barDigest}
+	client.UseBatchCompression(true).Apply(c)
+
+	wantBlobs := map[digest.Digest]client.CompressedBlobInfo{
+		fooDigest: client.CompressedBlobInfo{
+			CompressedSize: 16,
+			Data:           []byte("foo"),
+		},
+		barDigest: client.CompressedBlobInfo{
+			CompressedSize: 16,
+			Data:           []byte("bar"),
+		},
+	}
+	gotBlobs, err := c.BatchDownloadBlobsWithStats(ctx, digests)
+	if err != nil {
+		t.Errorf("client.BatchDownloadBlobs(ctx, digests) failed: %v", err)
+	}
+	if diff := cmp.Diff(wantBlobs, gotBlobs); diff != "" {
+		t.Errorf("client.BatchDownloadBlobs(ctx, digests) had diff (want -> got):\n%s", diff)
 	}
 }

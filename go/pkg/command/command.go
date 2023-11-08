@@ -115,6 +115,9 @@ type InputSpec struct {
 
 	// SymlinkBehavior represents the way symlinks will be handled.
 	SymlinkBehavior SymlinkBehaviorType
+
+	// Node properties of inputs.
+	InputNodeProperties map[string]*cpb.NodeProperties
 }
 
 // String returns the string representation of the VirtualInput.
@@ -309,17 +312,32 @@ type ExecutionOptions struct {
 	// Download command outputs after execution. Defaults to true.
 	DownloadOutputs bool
 
-	// Download command stdout and stderr. Defaults to true.
+	// Preserve mtimes for unchanged outputs when downloading. Defaults to false.
+	PreserveUnchangedOutputMtime bool
+
+	// Download command stdout and stderr. Defaults to true. If StreamOutErr is also set, this value
+	// is ignored for uncached actions if the server provides log streams for both stdout and stderr.
+	// For cached action results, or if the server does not provide log streams for stdout or stderr,
+	// this value will determine whether stdout and stderr is downloaded.
 	DownloadOutErr bool
+
+	// Request that stdout and stderr be streamed back to the client while the action is running.
+	// Defaults to false. If either stream is not provided by the server, the client will fall back to
+	// downloading the corresponding streams after the action has completed, provided DownloadOutErr
+	// is also set. The client may expect a delay in this scenario as the streams are downloaded after
+	// the fact.
+	StreamOutErr bool
 }
 
 // DefaultExecutionOptions returns the recommended ExecutionOptions.
 func DefaultExecutionOptions() *ExecutionOptions {
 	return &ExecutionOptions{
-		AcceptCached:    true,
-		DoNotCache:      false,
-		DownloadOutputs: true,
-		DownloadOutErr:  true,
+		AcceptCached:                 true,
+		DoNotCache:                   false,
+		DownloadOutputs:              true,
+		PreserveUnchangedOutputMtime: false,
+		DownloadOutErr:               true,
+		StreamOutErr:                 false,
 	}
 }
 
@@ -508,6 +526,8 @@ type Metadata struct {
 	OutputFileDigests map[string]digest.Digest
 	// Output Directory digests.
 	OutputDirectoryDigests map[string]digest.Digest
+	// Output Symlinks.
+	OutputSymlinks map[string]string
 	// Missing digests that are uploaded to CAS.
 	MissingDigests []digest.Digest
 	// LogicalBytesUploaded is the sum of sizes in bytes of the blobs that were uploaded. It should be
@@ -522,6 +542,10 @@ type Metadata struct {
 	// RealBytesDownloaded is the number of bytes that were put on the wire for download (exclusing metadata).
 	// It may differ from LogicalBytesDownloaded due to compression.
 	RealBytesDownloaded int64
+	// StderrDigest is a digest of the standard error after being executed.
+	StderrDigest digest.Digest
+	// StdoutDigest is a digest of the standard output after being executed.
+	StdoutDigest digest.Digest
 	// TODO(olaola): Add a lot of other fields.
 }
 
@@ -565,6 +589,35 @@ func (c *Command) ToREProto(useOutputPathsField bool) *repb.Command {
 		sort.Slice(cmdPb.Platform.Properties, func(i, j int) bool { return cmdPb.Platform.Properties[i].Name < cmdPb.Platform.Properties[j].Name })
 	}
 	return cmdPb
+}
+
+func FromREProto(cmdPb *repb.Command) *Command {
+	cmd := &Command{
+		InputSpec: &InputSpec{
+			EnvironmentVariables: make(map[string]string),
+			InputNodeProperties:  make(map[string]*cpb.NodeProperties),
+		},
+		Identifiers: &Identifiers{},
+		WorkingDir:  cmdPb.WorkingDirectory,
+		OutputFiles: cmdPb.OutputFiles,
+		OutputDirs:  cmdPb.OutputDirectories,
+		Platform:    make(map[string]string),
+		Args:        cmdPb.Arguments,
+	}
+
+	// In v2.1 of the RE API the `output_{files, directories}` fields were
+	// replaced by a single field: `output_paths`.
+	if len(cmdPb.OutputPaths) > 0 {
+		cmd.OutputFiles = cmdPb.OutputPaths
+		cmd.OutputDirs = nil
+	}
+	for _, ev := range cmdPb.EnvironmentVariables {
+		cmd.InputSpec.EnvironmentVariables[ev.Name] = ev.Value
+	}
+	for _, pt := range cmdPb.GetPlatform().GetProperties() {
+		cmd.Platform[pt.Name] = pt.Value
+	}
+	return cmd
 }
 
 // FromProto parses a Command struct from a proto message.
@@ -617,7 +670,48 @@ func inputSpecFromProto(is *cpb.InputSpec) *InputSpec {
 		InputExclusions:      excl,
 		EnvironmentVariables: is.GetEnvironmentVariables(),
 		SymlinkBehavior:      symlinkBehaviorFromProto(is.GetSymlinkBehavior()),
+		InputNodeProperties:  is.GetInputNodeProperties(),
 	}
+}
+
+func NodePropertiesToAPI(np *cpb.NodeProperties) *repb.NodeProperties {
+	if np == nil {
+		return nil
+	}
+	res := &repb.NodeProperties{
+		Mtime:    np.GetMtime(),
+		UnixMode: np.GetUnixMode(),
+	}
+	if np.Properties != nil {
+		res.Properties = make([]*repb.NodeProperty, 0, len(np.Properties))
+	}
+	for _, p := range np.GetProperties() {
+		res.Properties = append(res.Properties, &repb.NodeProperty{
+			Name:  p.Name,
+			Value: p.Value,
+		})
+	}
+	return res
+}
+
+func NodePropertiesFromAPI(np *repb.NodeProperties) *cpb.NodeProperties {
+	if np == nil {
+		return nil
+	}
+	res := &cpb.NodeProperties{
+		Mtime:    np.GetMtime(),
+		UnixMode: np.GetUnixMode(),
+	}
+	if np.Properties != nil {
+		res.Properties = make([]*cpb.NodeProperty, 0, len(np.Properties))
+	}
+	for _, p := range np.GetProperties() {
+		res.Properties = append(res.Properties, &cpb.NodeProperty{
+			Name:  p.Name,
+			Value: p.Value,
+		})
+	}
+	return res
 }
 
 func inputSpecToProto(is *InputSpec) *cpb.InputSpec {
@@ -645,6 +739,7 @@ func inputSpecToProto(is *InputSpec) *cpb.InputSpec {
 		ExcludeInputs:        excl,
 		EnvironmentVariables: is.EnvironmentVariables,
 		SymlinkBehavior:      symlinkBehaviorToProto(is.SymlinkBehavior),
+		InputNodeProperties:  is.InputNodeProperties,
 	}
 }
 

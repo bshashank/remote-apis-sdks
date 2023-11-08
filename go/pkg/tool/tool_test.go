@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
@@ -12,7 +13,13 @@ import (
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/fakes"
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/outerr"
 	"github.com/google/go-cmp/cmp"
+	"google.golang.org/protobuf/encoding/prototext"
+
+	cpb "github.com/bazelbuild/remote-apis-sdks/go/api/command"
+	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 )
+
+var fooProperties = &cpb.NodeProperties{Properties: []*cpb.NodeProperty{{Name: "fooName", Value: "fooValue"}}}
 
 func TestTool_DownloadActionResult(t *testing.T) {
 	e, cleanup := fakes.NewTestEnv(t)
@@ -25,7 +32,7 @@ func TestTool_DownloadActionResult(t *testing.T) {
 	}
 	opt := command.DefaultExecutionOptions()
 	output := "output"
-	_, acDg := e.Set(cmd, opt, &command.Result{Status: command.CacheHitResultStatus}, &fakes.OutputFile{Path: "a/b/out", Contents: output},
+	_, acDg, _, _ := e.Set(cmd, opt, &command.Result{Status: command.CacheHitResultStatus}, &fakes.OutputFile{Path: "a/b/out", Contents: output},
 		fakes.StdOut("stdout"), fakes.StdErr("stderr"))
 
 	toolClient := &Client{GrpcClient: e.Client.GrpcClient}
@@ -59,21 +66,23 @@ func TestTool_ShowAction(t *testing.T) {
 		InputSpec: &command.InputSpec{
 			Inputs: []string{
 				"a/b/input.txt",
+				"a/b/input2.txt",
 			},
+			InputNodeProperties: map[string]*cpb.NodeProperties{"a/b/input2.txt": fooProperties},
 		},
 		OutputFiles: []string{"a/b/out"},
 	}
 
 	opt := command.DefaultExecutionOptions()
-	_, acDg := e.Set(cmd, opt, &command.Result{Status: command.CacheHitResultStatus}, &fakes.OutputFile{Path: "a/b/out", Contents: "output"},
-		fakes.StdOut("stdout"), fakes.StdErr("stderr"), &fakes.InputFile{Path: "a/b/input.txt", Contents: "input"})
+	_, acDg, _, _ := e.Set(cmd, opt, &command.Result{Status: command.CacheHitResultStatus}, &fakes.OutputFile{Path: "a/b/out", Contents: "output"},
+		fakes.StdOut("stdout"), fakes.StdErr("stderr"), &fakes.InputFile{Path: "a/b/input.txt", Contents: "input"}, &fakes.InputFile{Path: "a/b/input2.txt", Contents: "input2"})
 
 	toolClient := &Client{GrpcClient: e.Client.GrpcClient}
 	got, err := toolClient.ShowAction(context.Background(), acDg.String())
 	if err != nil {
 		t.Fatalf("ShowAction(%v) failed: %v", acDg.String(), err)
 	}
-	want := `Command
+	want := fmt.Sprintf(`Command
 =======
 Command Digest: 76a608e419da9ed3673f59b8b903f21dbf7cc3178281029151a090cac02d9e4d/15
 	tool
@@ -83,8 +92,9 @@ Platform
 
 Inputs
 ======
-[Root directory digest: e23e10be0d14b5b2b1b7af32de78dea554a74df5bb22b31ae6c49583c1a8aa0e/75]
-a/b/input.txt: [File digest: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/0]
+[Root directory digest: 456e94a43b31b158fa7b3fe8d3a8cd6f0b66ef8a6a05ab8350e03df83b9740b6/75]
+a/b/input.txt: [File digest: c96c6d5be8d08a12e7b5cdc1b207fa6b2430974c86803d8891675e76fd992c20/5]
+a/b/input2.txt: [File digest: 124d8541ff3d7a18b95432bdfbecd86816b86c8265bff44ef629765afb25f06b/6] [Node properties: %s]
 
 ------------------------------------------------------------------------
 Action Result
@@ -99,7 +109,7 @@ a/b/out, digest: e0ee8bb50685e05fa0f47ed04203ae953fdfd055f5bd2892ea186504254f8c3
 
 Output Files From Directories
 =============================
-`
+`, prototext.MarshalOptions{Multiline: false}.Format(fooProperties))
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Fatalf("ShowAction(%v) returned diff (-want +got): %v\n\ngot: %v\n\nwant: %v\n", acDg.String(), diff, got, want)
 	}
@@ -109,29 +119,20 @@ func TestTool_CheckDeterminism(t *testing.T) {
 	e, cleanup := fakes.NewTestEnv(t)
 	defer cleanup()
 	cmd := &command.Command{
-		Args:        []string{"foo bar baz"},
+		Args:        []string{"foo", "bar", "baz"},
 		ExecRoot:    e.ExecRoot,
 		InputSpec:   &command.InputSpec{Inputs: []string{"i1", "i2"}},
 		OutputFiles: []string{"a/b/out"},
 	}
-	if err := os.WriteFile(filepath.Join(e.ExecRoot, "i1"), []byte("i1"), 0644); err != nil {
-		t.Fatalf("failed creating input file: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(e.ExecRoot, "i2"), []byte("i2"), 0644); err != nil {
-		t.Fatalf("failed creating input file: %v", err)
-	}
-	out := "output"
-	opt := &command.ExecutionOptions{AcceptCached: false, DownloadOutputs: true, DownloadOutErr: true}
-	_, acDg := e.Set(cmd, opt, &command.Result{Status: command.SuccessResultStatus}, &fakes.OutputFile{Path: "a/b/out", Contents: out})
+	_, acDg, _, _ := e.Set(cmd, command.DefaultExecutionOptions(), &command.Result{Status: command.SuccessResultStatus}, &fakes.InputFile{Path: "i1", Contents: "i1"}, &fakes.InputFile{Path: "i2", Contents: "i2"}, &fakes.OutputFile{Path: "a/b/out", Contents: "out"})
 
 	client := &Client{GrpcClient: e.Client.GrpcClient}
 	if err := client.CheckDeterminism(context.Background(), acDg.String(), "", 2); err != nil {
 		t.Errorf("CheckDeterminism returned an error: %v", err)
 	}
-	// Now execute again with changed inputs.
+	// Now execute again and return a different output.
 	testOnlyStartDeterminismExec = func() {
-		out = "output2"
-		e.Set(cmd, opt, &command.Result{Status: command.SuccessResultStatus}, &fakes.OutputFile{Path: "a/b/out", Contents: out})
+		e.Set(cmd, command.DefaultExecutionOptions(), &command.Result{Status: command.SuccessResultStatus}, &fakes.InputFile{Path: "i1", Contents: "i1"}, &fakes.InputFile{Path: "i2", Contents: "i2"}, &fakes.OutputFile{Path: "a/b/out", Contents: "out2"})
 	}
 	defer func() { testOnlyStartDeterminismExec = func() {} }()
 	if err := client.CheckDeterminism(context.Background(), acDg.String(), "", 2); err == nil {
@@ -139,25 +140,82 @@ func TestTool_CheckDeterminism(t *testing.T) {
 	}
 }
 
+func TestTool_DownloadAction(t *testing.T) {
+	e, cleanup := fakes.NewTestEnv(t)
+	defer cleanup()
+	cmd := &command.Command{
+		Args:        []string{"foo", "bar", "baz"},
+		ExecRoot:    e.ExecRoot,
+		InputSpec:   &command.InputSpec{Inputs: []string{"i1", "a/b/i2"}, InputNodeProperties: map[string]*cpb.NodeProperties{"i1": fooProperties}},
+		OutputFiles: []string{"a/b/out"},
+	}
+	_, acDg, _, _ := e.Set(cmd, command.DefaultExecutionOptions(), &command.Result{Status: command.SuccessResultStatus}, &fakes.InputFile{Path: "i1", Contents: "i1"}, &fakes.InputFile{Path: "a/b/i2", Contents: "i2"})
+
+	client := &Client{GrpcClient: e.Client.GrpcClient}
+	tmpDir := filepath.Join(t.TempDir(), "action_root")
+	os.MkdirAll(tmpDir, os.ModePerm)
+	if err := client.DownloadAction(context.Background(), acDg.String(), tmpDir, true); err != nil {
+		t.Errorf("error DownloadAction: %v", err)
+	}
+
+	reCmdPb := &repb.Command{
+		Arguments:   []string{"foo", "bar", "baz"},
+		OutputFiles: []string{"a/b/out"},
+	}
+	acPb := &repb.Action{
+		CommandDigest:   digest.TestNewFromMessage(reCmdPb).ToProto(),
+		InputRootDigest: &repb.Digest{Hash: "01dc5b6fa6d16d30bf80a7d88ff58f13fe801c4060b9782253b94e793444df05", SizeBytes: 176},
+	}
+	ipPb := &cpb.InputSpec{InputNodeProperties: cmd.InputSpec.InputNodeProperties}
+	expectedContents := []struct {
+		path     string
+		contents string
+	}{
+		{
+			path:     "ac.textproto",
+			contents: prototext.Format(acPb),
+		},
+		{
+			path:     "cmd.textproto",
+			contents: prototext.Format(reCmdPb),
+		},
+		{
+			path:     "input_node_properties.textproto",
+			contents: prototext.Format(ipPb),
+		},
+		{
+			path:     "input/i1",
+			contents: "i1",
+		},
+		{
+			path:     "input/a/b/i2",
+			contents: "i2",
+		},
+	}
+	for _, ec := range expectedContents {
+		fp := filepath.Join(tmpDir, ec.path)
+		got, err := os.ReadFile(fp)
+		if err != nil {
+			t.Fatalf("Unable to read downloaded action file %v: %v", fp, err)
+		}
+		if diff := cmp.Diff(ec.contents, string(got)); diff != "" {
+			t.Errorf("Incorrect content in downloaded file %v: diff (-want +got): %v\n\ngot: %s\n\nwant: %v\n", fp, diff, got, ec.contents)
+		}
+	}
+}
+
 func TestTool_ExecuteAction(t *testing.T) {
 	e, cleanup := fakes.NewTestEnv(t)
 	defer cleanup()
 	cmd := &command.Command{
-		Args:        []string{"foo bar baz"},
+		Args:        []string{"foo", "bar", "baz"},
 		ExecRoot:    e.ExecRoot,
-		InputSpec:   &command.InputSpec{Inputs: []string{"i1", "i2"}},
+		InputSpec:   &command.InputSpec{Inputs: []string{"i1", "i2"}, InputNodeProperties: map[string]*cpb.NodeProperties{"i1": fooProperties}},
 		OutputFiles: []string{"a/b/out"},
 	}
-	if err := os.WriteFile(filepath.Join(e.ExecRoot, "i1"), []byte("i1"), 0644); err != nil {
-		t.Fatalf("failed creating input file: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(e.ExecRoot, "i2"), []byte("i2"), 0644); err != nil {
-		t.Fatalf("failed creating input file: %v", err)
-	}
-	out := "output"
 	opt := &command.ExecutionOptions{AcceptCached: false, DownloadOutputs: true, DownloadOutErr: true}
-	_, acDg := e.Set(cmd, opt, &command.Result{Status: command.SuccessResultStatus}, &fakes.OutputFile{Path: "a/b/out", Contents: out},
-		fakes.StdOut("stdout"), fakes.StdErr("stderr"))
+	_, acDg, _, _ := e.Set(cmd, opt, &command.Result{Status: command.SuccessResultStatus}, &fakes.OutputFile{Path: "a/b/out", Contents: "out"},
+		&fakes.InputFile{Path: "i1", Contents: "i1"}, &fakes.InputFile{Path: "i2", Contents: "i2"}, fakes.StdOut("stdout"), fakes.StdErr("stderr"))
 
 	client := &Client{GrpcClient: e.Client.GrpcClient}
 	oe := outerr.NewRecordingOutErr()
@@ -171,16 +229,24 @@ func TestTool_ExecuteAction(t *testing.T) {
 		t.Errorf("Incorrect stdout %v, expected \"stdout\"", oe.Stdout())
 	}
 	// Now execute again with changed inputs.
-	tmpDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(tmpDir, "i1"), []byte("i11"), 0644); err != nil {
-		t.Fatalf("failed creating input file: %v", err)
+	tmpDir := filepath.Join(t.TempDir(), "action_root")
+	os.MkdirAll(tmpDir, os.ModePerm)
+	inputRoot := filepath.Join(tmpDir, "input")
+	if err := client.DownloadAction(context.Background(), acDg.String(), tmpDir, true); err != nil {
+		t.Errorf("error DownloadAction: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "i2"), []byte("i22"), 0644); err != nil {
-		t.Fatalf("failed creating input file: %v", err)
+	if err := os.WriteFile(filepath.Join(inputRoot, "i1"), []byte("i11"), 0644); err != nil {
+		t.Fatalf("failed overriding input file: %v", err)
 	}
-	cmd.ExecRoot = tmpDir
-	_, acDg2 := e.Set(cmd, opt, &command.Result{Status: command.SuccessResultStatus}, &fakes.OutputFile{Path: "a/b/out", Contents: out},
+	if err := os.WriteFile(filepath.Join(inputRoot, "i2"), []byte("i22"), 0644); err != nil {
+		t.Fatalf("failed overriding input file: %v", err)
+	}
+	cmd.ExecRoot = inputRoot
+	_, acDg2, _, _ := e.Set(cmd, opt, &command.Result{Status: command.SuccessResultStatus}, &fakes.OutputFile{Path: "a/b/out", Contents: "out2"},
 		fakes.StdOut("stdout2"), fakes.StdErr("stderr2"))
+	if diff := cmp.Diff(acDg, acDg2); diff == "" {
+		t.Fatalf("expected action digest to change after input change, got %v\n", acDg)
+	}
 	oe = outerr.NewRecordingOutErr()
 	if _, err := client.ExecuteAction(context.Background(), acDg2.String(), "", tmpDir, oe); err != nil {
 		t.Errorf("error executeAction: %v", err)
@@ -191,14 +257,44 @@ func TestTool_ExecuteAction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unable to read downloaded output %v: %v", fp, err)
 	}
-	if string(c) != out {
-		t.Fatalf("Incorrect content in downloaded file %v, want %s, got %s", fp, out, c)
+	if string(c) != "out2" {
+		t.Fatalf("Incorrect content in downloaded file %v, want \"out2\", got %s", fp, c)
 	}
 	if string(oe.Stderr()) != "stderr2" {
-		t.Errorf("Incorrect stderr %v, expected \"stderr\"", oe.Stderr())
+		t.Errorf("Incorrect stderr %v, expected \"stderr2\"", oe.Stderr())
 	}
 	if string(oe.Stdout()) != "stdout2" {
-		t.Errorf("Incorrect stdout %v, expected \"stdout\"", oe.Stdout())
+		t.Errorf("Incorrect stdout %v, expected \"stdout2\"", oe.Stdout())
+	}
+	// Now execute again without node properties.
+	fp = filepath.Join(tmpDir, "input_node_properties.textproto")
+	if err := os.Remove(fp); err != nil {
+		t.Fatalf("Unable to remove %v: %v", fp, err)
+	}
+	cmd.InputSpec.InputNodeProperties = nil
+	_, acDg3, _, _ := e.Set(cmd, opt, &command.Result{Status: command.SuccessResultStatus}, &fakes.OutputFile{Path: "a/b/out", Contents: "out3"},
+		fakes.StdOut("stdout3"), fakes.StdErr("stderr3"))
+	if diff := cmp.Diff(acDg2, acDg3); diff == "" {
+		t.Errorf("Expected action digests to be different when input node properties change, got: %v\n", acDg2)
+	}
+	oe = outerr.NewRecordingOutErr()
+	if _, err := client.ExecuteAction(context.Background(), acDg3.String(), "", tmpDir, oe); err != nil {
+		t.Errorf("error executeAction: %v", err)
+	}
+
+	fp = filepath.Join(tmpDir, "a/b/out")
+	c, err = os.ReadFile(fp)
+	if err != nil {
+		t.Fatalf("Unable to read downloaded output %v: %v", fp, err)
+	}
+	if string(c) != "out3" {
+		t.Fatalf("Incorrect content in downloaded file %v, want \"out3\", got %s", fp, c)
+	}
+	if string(oe.Stderr()) != "stderr3" {
+		t.Errorf("Incorrect stderr %v, expected \"stderr3\"", oe.Stderr())
+	}
+	if string(oe.Stdout()) != "stdout3" {
+		t.Errorf("Incorrect stdout %v, expected \"stdout3\"", oe.Stdout())
 	}
 }
 
@@ -206,9 +302,9 @@ func TestTool_ExecuteActionFromRoot(t *testing.T) {
 	e, cleanup := fakes.NewTestEnv(t)
 	defer cleanup()
 	cmd := &command.Command{
-		Args:        []string{"foo bar baz"},
+		Args:        []string{"foo", "bar", "baz"},
 		ExecRoot:    e.ExecRoot,
-		InputSpec:   &command.InputSpec{Inputs: []string{"i1", "i2"}},
+		InputSpec:   &command.InputSpec{Inputs: []string{"i1", "i2"}, InputNodeProperties: map[string]*cpb.NodeProperties{"i1": fooProperties}},
 		OutputFiles: []string{"a/b/out"},
 	}
 	// Create files necessary for the fake
@@ -218,9 +314,8 @@ func TestTool_ExecuteActionFromRoot(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(e.ExecRoot, "i2"), []byte("i2"), 0644); err != nil {
 		t.Fatalf("failed creating input file: %v", err)
 	}
-	out := "output"
 	opt := &command.ExecutionOptions{AcceptCached: false, DownloadOutputs: false, DownloadOutErr: true}
-	e.Set(cmd, opt, &command.Result{Status: command.SuccessResultStatus}, &fakes.OutputFile{Path: "a/b/out", Contents: out},
+	e.Set(cmd, opt, &command.Result{Status: command.SuccessResultStatus}, &fakes.OutputFile{Path: "a/b/out", Contents: "out"},
 		fakes.StdOut("stdout"), fakes.StdErr("stderr"))
 
 	client := &Client{GrpcClient: e.Client.GrpcClient}
@@ -233,12 +328,22 @@ func TestTool_ExecuteActionFromRoot(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(e.ExecRoot, "input", "i2"), []byte("i2"), 0644); err != nil {
 		t.Fatalf("failed creating input file: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(e.ExecRoot, "cmd.textproto"), []byte(`arguments: "foo bar baz"
-	output_files: "a/b/out"`), 0644); err != nil {
+	ipPb := &cpb.InputSpec{
+		InputNodeProperties: map[string]*cpb.NodeProperties{"i1": fooProperties},
+	}
+	if err := os.WriteFile(filepath.Join(e.ExecRoot, "input_node_properties.textproto"), []byte(prototext.Format(ipPb)), 0644); err != nil {
+		t.Fatalf("failed creating input node properties file: %v", err)
+	}
+	reCmdPb := &repb.Command{
+		Arguments:   []string{"foo", "bar", "baz"},
+		OutputFiles: []string{"a/b/out"},
+	}
+	if err := os.WriteFile(filepath.Join(e.ExecRoot, "cmd.textproto"), []byte(prototext.Format(reCmdPb)), 0644); err != nil {
 		t.Fatalf("failed creating command file: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(e.ExecRoot, "ac.textproto"), []byte(""), 0644); err != nil {
-		t.Fatalf("failed creating command file: %v", err)
+	// The tool will embed the Command proto digest into the Action proto, so the `command_digest` field is effectively ignored:
+	if err := os.WriteFile(filepath.Join(e.ExecRoot, "ac.textproto"), []byte(`command_digest: {hash: "whatever"}`), 0644); err != nil {
+		t.Fatalf("failed creating action file: %v", err)
 	}
 	if _, err := client.ExecuteAction(context.Background(), "", e.ExecRoot, "", oe); err != nil {
 		t.Errorf("error executeAction: %v", err)
