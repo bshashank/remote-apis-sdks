@@ -1,4 +1,4 @@
-module github.com/bazelbuild/remote-apis-sdks
+module github.com/bshashank/remote-apis-sdks
 
 go 1.20
 
